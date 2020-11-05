@@ -191,6 +191,8 @@ func (r *Replica) executeWriteBatch(
 	for {
 		select {
 		case propResult := <-ch:
+			log.Eventf(ctx, "propsal result, intents = %d, endTxns = %d", len(propResult.EncounteredIntents), len(propResult.EndTxns))
+
 			// Semi-synchronously process any intents that need resolving here in
 			// order to apply back pressure on the client which generated them. The
 			// resolution is semi-synchronous in that there is a limited number of

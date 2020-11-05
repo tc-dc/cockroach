@@ -157,8 +157,10 @@ func (r *Replica) evalAndPropose(
 			"command is too large: %d bytes (max: %d)", quotaSize, maxSize,
 		))
 	}
+
 	var err error
 	proposal.quotaAlloc, err = r.maybeAcquireProposalQuota(ctx, quotaSize)
+	log.Event(proposal.ctx, "acquire proposal quota")
 	if err != nil {
 		return nil, nil, 0, roachpb.NewError(err)
 	}
@@ -184,6 +186,8 @@ func (r *Replica) evalAndPropose(
 	}
 
 	maxLeaseIndex, pErr := r.propose(ctx, proposal)
+	log.Event(proposal.ctx, "propose")
+
 	if pErr != nil {
 		return nil, nil, 0, pErr
 	}
@@ -437,6 +441,8 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 
 	var hasReady bool
 	var rd raft.Ready
+
+	log.Event(ctx,"handleRaftReadyRaftMuLocked")
 	r.mu.Lock()
 	lastIndex := r.mu.lastIndex // used for append below
 	lastTerm := r.mu.lastTerm
@@ -487,6 +493,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		return stats, "", nil
 	}
 
+	log.Event(ctx, "raft ready")
 	logRaftReady(ctx, rd)
 
 	refreshReason := noReason
@@ -655,6 +662,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	writer := batch.Distinct()
 	prevLastIndex := lastIndex
 	if len(rd.Entries) > 0 {
+		r.traceEntries(rd.Entries, "begin append")
 		// All of the entries are appended to distinct keys, returning a new
 		// last index.
 		thinEntries, sideLoadedEntriesSize, err := r.maybeSideloadEntriesRaftMuLocked(ctx, rd.Entries)
@@ -669,6 +677,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			const expl = "during append"
 			return stats, expl, errors.Wrap(err, expl)
 		}
+		r.traceEntries(rd.Entries, "end append")
 	}
 	if !raft.IsEmptyHardState(rd.HardState) {
 		if !r.IsInitialized() && rd.HardState.Commit != 0 {
@@ -702,6 +711,8 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// were not persisted to disk, it wouldn't be a problem because raft does not
 	// infer the that entries are persisted on the node that sends a snapshot.
 	commitStart := timeutil.Now()
+	r.traceEntries(rd.Entries, "begin batch commit")
+
 	if err := batch.Commit(rd.MustSync && !disableSyncRaftLog.Get(&r.store.cfg.Settings.SV)); err != nil {
 		const expl = "while committing batch"
 		return stats, expl, errors.Wrap(err, expl)
@@ -710,6 +721,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		elapsed := timeutil.Since(commitStart)
 		r.store.metrics.RaftLogCommitLatency.RecordValue(elapsed.Nanoseconds())
 	}
+	r.traceEntries(rd.Entries, "end batch commit")
 
 	if len(rd.Entries) > 0 {
 		// We may have just overwritten parts of the log which contain
@@ -732,6 +744,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 	}
 
+	log.Event(ctx, "Begin update state")
 	// Update protected state - last index, last term, raft log size, and raft
 	// leader ID.
 	r.mu.Lock()
@@ -754,13 +767,20 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		r.store.replicateQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
 	}
 
+	r.traceEntries(rd.Entries, "begin raftEntryCache")
+
 	// Update raft log entry cache. We clear any older, uncommitted log entries
 	// and cache the latest ones.
 	r.store.raftEntryCache.Add(r.RangeID, rd.Entries, true /* truncate */)
+	r.traceEntries(rd.Entries, "end raftEntryCache")
+
 	r.sendRaftMessages(ctx, otherMsgs)
-	r.traceEntries(rd.CommittedEntries, "committed, before applying any entries")
+	r.traceEntries(rd.Entries, "committed, before applying any entries")
 
 	applicationStart := timeutil.Now()
+
+	r.traceEntries(rd.Entries, "begin application apply")
+
 	if len(rd.CommittedEntries) > 0 {
 		err := appTask.ApplyCommittedEntries(ctx)
 		stats.applyCommittedEntriesStats = sm.moveStats()
@@ -807,7 +827,9 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// replica ID ensures that our replica ID could not have changed.
 	const expl = "during advance"
 
+	r.traceEntries(rd.Entries, "begin advance raft group")
 	r.mu.Lock()
+	log.Event(ctx, "advanced raft group")
 	err = r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
 		raftGroup.Advance(rd)
 		if stats.numConfChangeEntries > 0 {
@@ -842,7 +864,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// raft group, this only happens if hasReady == true. If we don't release
 	// quota back at the end of handleRaftReadyRaftMuLocked, the next write will
 	// get blocked.
+
+	r.traceEntries(rd.Entries, "update proposal quota")
 	r.updateProposalQuotaRaftMuLocked(ctx, lastLeaderID)
+	r.traceEntries(rd.Entries, "handleRaftReady complete")
 	return stats, "", nil
 }
 

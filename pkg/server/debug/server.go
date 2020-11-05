@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"path"
+	"runtime/debug"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -41,6 +42,8 @@ import (
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc/metadata"
 )
+
+var goGcSetting = settings.RegisterIntSetting("server.gogc", "the value to set GOGC to", 100)
 
 func init() {
 	// Disable the net/trace auth handler.
@@ -94,6 +97,14 @@ type Server struct {
 
 // NewServer sets up a debug server.
 func NewServer(st *cluster.Settings, hbaConfDebugFn http.HandlerFunc) *Server {
+	reconfigure := func() {
+		newValue := goGcSetting.Get(&st.SV)
+		debug.SetGCPercent(int(newValue))
+	}
+
+	goGcSetting.SetOnChange(&st.SV, reconfigure)
+	reconfigure()
+
 	mux := http.NewServeMux()
 
 	// Install a redirect to the UI's collection of debug tools.
